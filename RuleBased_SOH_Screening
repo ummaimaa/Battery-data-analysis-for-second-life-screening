@@ -1,0 +1,542 @@
+%% Rapid Second-Life Battery Screening - SOH Percentage Classification
+% Good >= 80% | Second-Life: 60-79% | Degraded < 60%
+% Run BatterySignalAnalysis.m first to generate allBatteries.mat
+
+fprintf('\n=== Second-Life Battery SOH Screening ===\n');
+fprintf('Classification: Good(>=80%%) | Second-Life(60-79%%) | Degraded(<60%%)\n\n');
+
+%% 1. Load Battery Structure
+if ~exist('allBatteries.mat','file')
+error('allBatteries.mat not found. Run BatterySignalAnalysis.m first.');
+end
+
+load('allBatteries.mat'); % loads allBatteries and cycleTypeSummary
+batteryNames = fieldnames(allBatteries);
+
+%% 2. Create Folder for Results
+resultsDir = 'FeatureResults';
+if ~exist(resultsDir,'dir')
+mkdir(resultsDir);
+end
+
+%% 3. Parameters
+Fs = 1;
+segmentLength = 120;
+segmentStep = 60;
+band = [0.05 0.2];
+
+featureTable = [];
+
+fprintf('Extracting TF Features from Discharge Cycles...\n\n');
+
+%% 4. Loop Through Batteries and Discharge Cycles
+for b = 1:length(batteryNames)
+batteryName = batteryNames{b};
+cycles = allBatteries.(batteryName).cycle;
+fprintf(' Processing %s (%d total cycles)...\n', batteryName, length(cycles));
+nDischarge = 0;
+for c = 1:length(cycles)
+if ~strcmp(lower(cycles(c).type),'discharge')
+continue;
+end
+nDischarge = nDischarge + 1;
+data = cycles(c).data;
+rawTime = data.Time;
+rawVoltage = data.Voltage_measured;
+rawCurrent = data.Current_measured;
+%% --- Resample ---
+tUniform = (0:1:max(rawTime))';
+vUniform = interp1(rawTime, rawVoltage, tUniform, 'pchip');
+%% --- Sliding Window Segments ---
+N = length(tUniform);
+segStart = 1:segmentStep:(N - segmentLength);
+for s = 1:length(segStart)
+idx1 = segStart(s);
+idx2 = idx1 + segmentLength - 1;
+vSeg = detrend(vUniform(idx1:idx2));
+%% --- STFT ---
+window = 64;
+noverlap = 32;
+nfft = 128;
+[~, F, ~, P] = spectrogram(vSeg, window, noverlap, nfft, Fs);
+%% --- Feature 1: Band Energy ---
+bandIdx = F >= band(1) & F <= band(2);
+bandEnergy = mean(sum(P(bandIdx,:),1));
+%% --- Feature 2: Spectral Centroid ---
+specPower = mean(P,2);
+spectralCentroid = sum(F .* specPower) / sum(specPower);
+%% --- Feature 3: Spectral Entropy ---
+p = specPower ./ sum(specPower);
+spectralEntropy = -sum(p .* log2(p + eps));
+%% --- Capacity ---
+capacity = NaN;
+if isfield(data,'Capacity')
+cap = data.Capacity;
+if isnumeric(cap) && ~isempty(cap)
+capacity = cap(1);
+end
+end
+%% --- Store Row ---
+featureTable = [featureTable;
+{batteryName, c, nDischarge, bandEnergy, ...
+spectralCentroid, spectralEntropy, capacity}];
+end
+end
+fprintf(' -> %d discharge cycles processed.\n', nDischarge);
+end
+
+%% 5. Convert to Table
+featureTable = cell2table(featureTable, ...
+'VariableNames',{'Battery','CycleIndex','DischargeNumber', ...
+'BandEnergy','SpectralCentroid','SpectralEntropy','Capacity'});
+
+fprintf('\nTotal Segments Analysed: %d\n', height(featureTable));
+
+%% 5.1 Ensure Numeric Columns
+numericCols = {'BandEnergy','SpectralCentroid','SpectralEntropy','Capacity'};
+
+for nc = 1:length(numericCols)
+col = numericCols{nc};
+if iscell(featureTable.(col))
+tmp = nan(height(featureTable),1);
+for i = 1:height(featureTable)
+v = featureTable.(col){i};
+if isnumeric(v) && ~isempty(v)
+tmp(i) = v(1);
+end
+end
+featureTable.(col) = tmp;
+end
+end
+
+%% =========================================================
+%% 6. SOH PERCENTAGE ESTIMATION
+%% =========================================================
+%
+% Strategy:
+% - Use Capacity directly when available (most reliable)
+% - Fall back to Band Energy when Capacity is missing
+%
+% Reference capacity (nominal for NASA dataset): ~2.0 Ah
+% SOH(%) = (Current Capacity / Nominal Capacity) x 100
+%
+% When using Band Energy (proxy):
+% - Normalise band energy to [0,1] range
+% - Map to SOH range [30%, 100%] (realistic degradation window)
+
+NOMINAL_CAPACITY = 2.0; % Ah (NASA dataset nominal)
+SOH_MIN_PROXY = 30; % % floor when using energy proxy
+SOH_MAX_PROXY = 100; % % ceiling when using energy proxy
+
+fprintf('\nEstimating SOH Percentage...\n');
+
+nRows = height(featureTable);
+SOH = nan(nRows,1);
+SOH_source = strings(nRows,1);
+
+%% --- Per-battery energy min/max for normalisation ---
+for b = 1:length(batteryNames)
+bn = batteryNames{b};
+idx = strcmp(featureTable.Battery, bn);
+e = featureTable.BandEnergy(idx);
+eMin = min(e); eMax = max(e);
+capVals = featureTable.Capacity(idx);
+hasCapacity = ~isnan(capVals);
+rows = find(idx);
+for r = 1:length(rows)
+ri = rows(r);
+if ~isnan(featureTable.Capacity(ri))
+% --- Direct capacity-based SOH ---
+SOH(ri) = (featureTable.Capacity(ri) / NOMINAL_CAPACITY) * 100;
+SOH(ri) = min(max(SOH(ri), 0), 100); % clamp
+SOH_source(ri) = "Capacity";
+else
+% --- Proxy via band energy ---
+if eMax > eMin
+eNorm = (featureTable.BandEnergy(ri) - eMin) / (eMax - eMin);
+else
+eNorm = 0.5;
+end
+SOH(ri) = SOH_MIN_PROXY + eNorm * (SOH_MAX_PROXY - SOH_MIN_PROXY);
+SOH_source(ri) = "EnergyProxy";
+end
+end
+end
+
+featureTable.SOH_pct = SOH;
+featureTable.SOH_source = SOH_source;
+
+%% =========================================================
+%% 7. PERCENTAGE-BASED CLASSIFICATION
+%% =========================================================
+%
+% Good >= 80% --> Healthy, no second-life needed
+% Second-Life 60-79% --> Suitable for second-life applications
+% Degraded < 60% --> End of life, retire or recycle
+
+fprintf('Applying Percentage-Based Classification...\n');
+
+classLabel = strings(nRows,1);
+recommendation = strings(nRows,1);
+
+for i = 1:nRows
+soh = featureTable.SOH_pct(i);
+if soh >= 80
+classLabel(i) = "Good";
+recommendation(i) = "Continue Primary Use";
+elseif soh >= 60
+classLabel(i) = "Second-Life";
+recommendation(i) = "Repurpose for 2nd Life";
+else
+classLabel(i) = "Degraded";
+recommendation(i) = "Retire / Recycle";
+end
+end
+
+featureTable.Class = classLabel;
+featureTable.Recommendation = recommendation;
+
+%% 8. Confidence Score (distance from nearest boundary)
+confidence = zeros(nRows,1);
+for i = 1:nRows
+soh = featureTable.SOH_pct(i);
+dist80 = abs(soh - 80);
+dist60 = abs(soh - 60);
+minDist = min(dist80, dist60);
+confidence(i) = min(minDist / 20, 1.0); % normalise to [0,1]
+end
+featureTable.Confidence = confidence;
+
+%% =========================================================
+%% 9. SUMMARY STATISTICS
+%% =========================================================
+
+fprintf('\n========================================\n');
+fprintf(' SOH CLASSIFICATION SUMMARY\n');
+fprintf('========================================\n');
+
+classes = ["Good","Second-Life","Degraded"];
+classColors = {'g','y','r'};
+
+for cl = 1:3
+idx = featureTable.Class == classes(cl);
+count = sum(idx);
+pct = 100 * count / nRows;
+avgSOH= mean(featureTable.SOH_pct(idx),'omitnan');
+fprintf('\n [%s]\n', classes(cl));
+fprintf(' Segments : %d (%.1f%% of total)\n', count, pct);
+fprintf(' Avg SOH : %.1f%%\n', avgSOH);
+switch classes(cl)
+case "Good"
+fprintf(' Condition : Battery health >= 80%%. Safe for primary use.\n');
+case "Second-Life"
+fprintf(' Condition : SOH 60-79%%. Viable for stationary storage or\n');
+fprintf(' low-power 2nd life applications.\n');
+case "Degraded"
+fprintf(' Condition : SOH < 60%%. Significant capacity loss.\n');
+fprintf(' Recommend retirement and recycling.\n');
+end
+end
+
+fprintf('\n========================================\n\n');
+
+%% =========================================================
+%% 10. PER-BATTERY SOH REPORT
+%% =========================================================
+
+fprintf('--- Per-Battery SOH Summary ---\n');
+fprintf('%-12s | %-8s | %-8s | %-12s | %-s\n', ...
+'Battery','AvgSOH%','MinSOH%','MaxSOH%','Dominant Class');
+fprintf('%s\n', repmat('-',1,70));
+
+for b = 1:length(batteryNames)
+bn = batteryNames{b};
+idx = strcmp(featureTable.Battery, bn);
+avgSOH = mean(featureTable.SOH_pct(idx),'omitnan');
+minSOH = min(featureTable.SOH_pct(idx));
+maxSOH = max(featureTable.SOH_pct(idx));
+% Dominant class by segment count
+subCls = featureTable.Class(idx);
+uCls = unique(subCls);
+cnts = arrayfun(@(x) sum(subCls==x), uCls);
+[~,mi] = max(cnts);
+domCls = uCls(mi);
+fprintf('%-12s | %-8.1f | %-8.1f | %-12.1f | %-s\n', ...
+bn, avgSOH, minSOH, maxSOH, domCls);
+end
+
+%% =========================================================
+%% 11. PLOTS
+%% =========================================================
+fprintf('\nGenerating Plots...\n');
+
+colorMap = containers.Map({'Good','Second-Life','Degraded'}, ...
+{[0 0.6 0],[1 0.8 0],[0.85 0.1 0.1]});
+
+%% -- Plot 1: SOH Distribution Histogram (colour-coded bands) --
+figure('Position',[100 100 800 450]);
+hold on;
+
+% Background bands
+fill([60 80 80 60],[-5 -5 nRows+5 nRows+5],[1 0.95 0.8],'EdgeColor','none','FaceAlpha',0.5);
+fill([80 101 101 80],[-5 -5 nRows+5 nRows+5],[0.85 0.95 0.85],'EdgeColor','none','FaceAlpha',0.5);
+fill([0 60 60 0],[-5 -5 nRows+5 nRows+5],[0.95 0.85 0.85],'EdgeColor','none','FaceAlpha',0.5);
+
+histogram(featureTable.SOH_pct, 40, 'FaceColor',[0.2 0.5 0.9],'EdgeColor','w');
+
+xline(80,'g--','LineWidth',2,'Label','80% (Good threshold)','LabelVerticalAlignment','top');
+xline(60,'r--','LineWidth',2,'Label','60% (Degraded threshold)','LabelVerticalAlignment','top');
+
+xlabel('Estimated SOH (%)','FontSize',12);
+ylabel('Segment Count','FontSize',12);
+title('SOH Distribution - All Battery Segments','FontSize',13,'FontWeight','bold');
+
+text(90, max(histcounts(featureTable.SOH_pct,40))*0.8, 'GOOD','Color',[0 0.5 0], ...
+'FontSize',13,'FontWeight','bold','HorizontalAlignment','center');
+text(70, max(histcounts(featureTable.SOH_pct,40))*0.8, '2ND LIFE','Color',[0.7 0.5 0], ...
+'FontSize',11,'FontWeight','bold','HorizontalAlignment','center');
+text(40, max(histcounts(featureTable.SOH_pct,40))*0.8, 'DEGRADED','Color',[0.8 0 0], ...
+'FontSize',12,'FontWeight','bold','HorizontalAlignment','center');
+
+grid on; xlim([0 105]);
+saveas(gcf, fullfile(resultsDir,'SOH_distribution.png'));
+fprintf(' Saved: SOH_distribution.png\n');
+
+%% -- Plot 2: SOH vs Cycle Number (all batteries, colour by class) --
+figure('Position',[100 100 900 500]);
+hold on;
+
+markers = {'o','s','^','d'};
+
+for b = 1:length(batteryNames)
+bn = batteryNames{b};
+idx = strcmp(featureTable.Battery, bn);
+sohVals = featureTable.SOH_pct(idx);
+cycleNos = featureTable.DischargeNumber(idx);
+classes = featureTable.Class(idx);
+clList = ["Good","Second-Life","Degraded"];
+for cl = 1:3
+clIdx = classes == clList(cl);
+c = colorMap(clList(cl));
+scatter(cycleNos(clIdx), sohVals(clIdx), 20, c, ...
+markers{mod(b-1,4)+1}, 'filled', 'MarkerFaceAlpha', 0.7);
+end
+end
+
+yline(80,'g--','LineWidth',2);
+yline(60,'r--','LineWidth',2);
+
+% Horizontal zone labels
+ylim([0 110]);
+fill([0 max(featureTable.DischargeNumber)+1 max(featureTable.DischargeNumber)+1 0], ...
+[80 80 110 110],[0 0.6 0],'FaceAlpha',0.05,'EdgeColor','none');
+fill([0 max(featureTable.DischargeNumber)+1 max(featureTable.DischargeNumber)+1 0], ...
+[60 60 80 80],[1 0.8 0],'FaceAlpha',0.08,'EdgeColor','none');
+fill([0 max(featureTable.DischargeNumber)+1 max(featureTable.DischargeNumber)+1 0], ...
+[0 0 60 60],[0.85 0.1 0.1],'FaceAlpha',0.05,'EdgeColor','none');
+
+xlabel('Discharge Cycle Number','FontSize',12);
+ylabel('Estimated SOH (%)','FontSize',12);
+title('SOH Degradation Over Discharge Cycles','FontSize',13,'FontWeight','bold');
+
+legend_entries = {};
+for b = 1:length(batteryNames)
+legend_entries{end+1} = batteryNames{b};
+end
+
+% Manually create legend patches for batteries
+h = zeros(length(batteryNames),1);
+for b = 1:length(batteryNames)
+h(b) = scatter(NaN,NaN,40,'k',markers{mod(b-1,4)+1},'filled');
+legend_entries{b} = batteryNames{b};
+end
+legend(h, legend_entries, 'Location','northeast','FontSize',9);
+
+grid on;
+saveas(gcf, fullfile(resultsDir,'SOH_vs_cycles.png'));
+fprintf(' Saved: SOH_vs_cycles.png\n');
+
+%% -- Plot 3: SOH Classification Pie Chart --
+figure('Position',[100 100 600 500]);
+
+nGood = sum(featureTable.Class == "Good");
+nSecond = sum(featureTable.Class == "Second-Life");
+nDegraded= sum(featureTable.Class == "Degraded");
+
+pieVals = [nGood, nSecond, nDegraded];
+pieLbls = {sprintf('Good\n(>=80%%)\n%d segs',nGood), ...
+sprintf('Second-Life\n(60-79%%)\n%d segs',nSecond), ...
+sprintf('Degraded\n(<60%%)\n%d segs',nDegraded)};
+
+p = pie(pieVals, pieLbls);
+
+% Set colours for pie slices
+p(1).FaceColor = [0 0.6 0];
+p(3).FaceColor = [1 0.8 0];
+p(5).FaceColor = [0.85 0.1 0.1];
+
+title('Battery SOH Classification Breakdown','FontSize',13,'FontWeight','bold');
+saveas(gcf, fullfile(resultsDir,'SOH_pie_chart.png'));
+fprintf(' Saved: SOH_pie_chart.png\n');
+
+%% -- Plot 4: Per-Battery Average SOH Bar Chart (FIXED CLASS COLORS) --
+figure('Position',[100 100 900 500]);
+hold on;
+
+% Compute average SOH for each battery
+nB = length(batteryNames);
+avgSOH_per_bat = zeros(nB,1);
+
+for b = 1:nB
+bn = batteryNames{b};
+idx = strcmp(featureTable.Battery,bn);
+avgSOH_per_bat(b) = mean(featureTable.SOH_pct(idx),'omitnan');
+end
+
+%% Assign colors STRICTLY by SOH thresholds
+% Green = Good (>=80)
+% Yellow = Second-Life (60-79)
+% Red = Degraded (<60)
+
+barColors = zeros(nB,3);
+
+for b = 1:nB
+if avgSOH_per_bat(b) >= 80
+% GOOD -> GREEN
+barColors(b,:) = [0 0.75 0];
+elseif avgSOH_per_bat(b) >= 60
+% SECOND-LIFE -> YELLOW
+barColors(b,:) = [1 0.8 0];
+else
+% DEGRADED -> RED
+barColors(b,:) = [0.85 0.1 0.1];
+end
+end
+
+%% Create bar chart
+bh = bar(avgSOH_per_bat,0.6);
+
+% Critical fix:
+% Set FaceColor ONCE, then assign all colors at once
+bh.FaceColor = 'flat';
+bh.CData = barColors;
+
+set(gca,'XTick',1:nB,...
+'XTickLabel',batteryNames,...
+'FontSize',14);
+
+%% Threshold lines
+yline(80,'--','80% Good Threshold',...
+'LineWidth',2,...
+'Color',[0 1 0],...
+'LabelHorizontalAlignment','left');
+
+yline(60,'--','60% Degraded Threshold',...
+'LineWidth',2,...
+'Color',[1 0 0],...
+'LabelHorizontalAlignment','left');
+
+ylim([0 110]);
+
+xlabel('Battery ID','FontSize',16);
+ylabel('Average SOH (%)','FontSize',16);
+title('Average SOH Per Battery (Colour = Classification)',...
+'FontSize',18,'FontWeight','bold');
+
+grid on;
+
+saveas(gcf, fullfile(resultsDir,'avg_SOH_per_battery.png'));
+fprintf(' Saved: avg_SOH_per_battery.png\n');
+
+%% -- Plot 5: Feature Distributions --
+figure('Position',[100 100 800 600]);
+
+featureTable.BandEnergy_N = normalize(featureTable.BandEnergy);
+featureTable.Centroid_N = normalize(featureTable.SpectralCentroid);
+featureTable.Entropy_N = normalize(featureTable.SpectralEntropy);
+
+subplot(3,1,1);
+histogram(featureTable.BandEnergy_N, 40, 'FaceColor',[0.2 0.5 0.9]);
+title('Band Energy Distribution (Normalised)'); grid on;
+
+subplot(3,1,2);
+histogram(featureTable.Centroid_N, 40, 'FaceColor',[0.9 0.5 0.2]);
+title('Spectral Centroid Distribution (Normalised)'); grid on;
+
+subplot(3,1,3);
+histogram(featureTable.Entropy_N, 40, 'FaceColor',[0.5 0.8 0.3]);
+title('Spectral Entropy Distribution (Normalised)'); grid on;
+
+saveas(gcf, fullfile(resultsDir,'feature_distributions.png'));
+fprintf(' Saved: feature_distributions.png\n');
+
+%% -- Plot 6: SOH vs Capacity (if available) --
+validIdx = ~isnan(featureTable.Capacity);
+if any(validIdx)
+figure('Position',[100 100 700 450]);
+hold on;
+clList = ["Good","Second-Life","Degraded"];
+for cl = 1:3
+targetClass = clList(cl);
+clIdx = classes == targetClass;
+c = colorMap(targetClass);
+scatter(cycleNos(clIdx), sohVals(clIdx), ...
+20, c, markers{mod(b-1,4)+1}, ...
+'filled', 'MarkerFaceAlpha', 0.7);
+end
+xlabel('Measured Capacity (Ah)','FontSize',12);
+ylabel('Estimated SOH (%)','FontSize',12);
+title('SOH vs Measured Capacity','FontSize',13,'FontWeight','bold');
+yline(80,'g--','LineWidth',1.5);
+yline(60,'r--','LineWidth',1.5);
+legend('Location','northwest');
+grid on;
+saveas(gcf, fullfile(resultsDir,'SOH_vs_capacity.png'));
+fprintf(' Saved: SOH_vs_capacity.png\n');
+r = corr(featureTable.BandEnergy_N(validIdx), ...
+featureTable.Capacity(validIdx), 'Rows','complete');
+fprintf('\nCorrelation (Band Energy vs Capacity): %.3f\n', r);
+end
+
+%% =========================================================
+%% 12. SECOND-LIFE RECOMMENDATION TABLE
+%% =========================================================
+
+fprintf('\n==============================================\n');
+fprintf(' SECOND-LIFE BATTERY RECOMMENDATION TABLE\n');
+fprintf('==============================================\n');
+fprintf('%-12s | %-8s | %-14s | %-s\n', ...
+'Battery','Avg SOH%','Classification','Recommendation');
+fprintf('%s\n', repmat('-',1,70));
+
+for b = 1:length(batteryNames)
+bn = batteryNames{b};
+idx = strcmp(featureTable.Battery,bn);
+avgSOH = mean(featureTable.SOH_pct(idx),'omitnan');
+if avgSOH >= 80
+cls = 'Good';
+rec = 'Primary use, no action';
+elseif avgSOH >= 60
+cls = 'Second-Life';
+rec = 'Use for energy storage/EV support';
+else
+cls = 'Degraded';
+rec = 'Retire / send to recycling';
+end
+fprintf('%-12s | %-8.1f | %-14s | %-s\n', bn, avgSOH, cls, rec);
+end
+
+fprintf('\n==============================================\n');
+fprintf('SECOND-LIFE USE CASES (SOH 60-79%%):\n');
+fprintf(' - Stationary energy storage (solar/wind buffering)\n');
+fprintf(' - Backup power systems / UPS\n');
+fprintf(' - Low-speed EV or e-bike packs\n');
+fprintf(' - Grid frequency regulation\n');
+fprintf('==============================================\n\n');
+
+%% 13. Save Results
+save('feature_table.mat','featureTable');
+fprintf('Results saved to feature_table.mat\n');
+fprintf('All plots saved in: %s\n', fullfile(pwd, resultsDir));
+fprintf('\n=== SOH Screening Complete ===\n');
+
