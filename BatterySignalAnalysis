@@ -1,0 +1,227 @@
+%% NASA Battery Data Analysis - Modified for Second-Life Screening
+clear; clc; close all;
+
+fprintf('=== NASA Battery Data Analysis (Second-Life Focus) ===\n');
+
+%% 1. Setup Directory
+dataDir = 'NASA_Battery_Data';
+if ~exist(dataDir, 'dir')
+mkdir(dataDir);
+end
+
+%% 2. Download Dataset (if needed)
+url = 'https://phm-datasets.s3.amazonaws.com/NASA/5.+Battery+Data+Set.zip';
+zipFile = fullfile(dataDir, 'Main_Dataset.zip');
+
+if ~exist(zipFile, 'file')
+fprintf('Downloading NASA Battery Dataset...\n');
+websave(zipFile, url);
+fprintf('Download complete.\n');
+else
+fprintf('Dataset already downloaded.\n');
+end
+
+%% 3. Extract Main ZIP
+mainExtractFolder = fullfile(dataDir, '5. Battery Data Set');
+if ~exist(mainExtractFolder, 'dir')
+unzip(zipFile, dataDir);
+fprintf('Main ZIP extracted.\n');
+else
+fprintf('Main ZIP already extracted.\n');
+end
+
+%% 4. Extract Nested ZIP Files
+innerZips = dir(fullfile(dataDir, '**', '*.zip'));
+
+for i = 1:length(innerZips)
+if strcmp(innerZips(i).name, 'Main_Dataset.zip')
+continue;
+end
+[~, zipName] = fileparts(innerZips(i).name);
+targetPath = fullfile(innerZips(i).folder, zipName);
+if ~exist(targetPath, 'dir')
+unzip(fullfile(innerZips(i).folder, innerZips(i).name), targetPath);
+end
+end
+fprintf('All files extracted.\n');
+
+%% 5. Load ALL Battery MAT Files - then pick random small subset
+allMatFiles = dir(fullfile(dataDir, '**', 'B*.mat'));
+if isempty(allMatFiles)
+error('No battery MAT files found. Check extraction path.');
+end
+
+fprintf('Total batteries available in dataset: %d\n', length(allMatFiles));
+
+%% --- RANDOM SUBSET SELECTION ---
+rng(42); % reproducible
+maxBatteries = min(4, length(allMatFiles));
+randIdx = randperm(length(allMatFiles), maxBatteries);
+selectedFiles = allMatFiles(randIdx);
+
+fprintf('Randomly selected %d batteries for analysis: ', maxBatteries);
+for k = 1:length(selectedFiles)
+[~, fname] = fileparts(selectedFiles(k).name);
+fprintf('%s ', fname);
+end
+fprintf('\n');
+
+%% 6. Load Selected Batteries
+allBatteries = struct;
+
+for k = 1:length(selectedFiles)
+temp = load(fullfile(selectedFiles(k).folder, selectedFiles(k).name));
+fnames = fieldnames(temp);
+varInside = fnames{1};
+allBatteries.(varInside) = temp.(varInside);
+end
+
+batteryNames = fieldnames(allBatteries);
+fprintf('%d Batteries Loaded.\n', length(batteryNames));
+
+%% 7. Classify Cycle Types
+fprintf('\n--- Cycle Type Classification Per Battery ---\n');
+fprintf('%-12s | %-10s | %-10s | %-10s | %-10s\n', ...
+'Battery','Charge','Discharge','Impedance','Other');
+fprintf('%s\n', repmat('-',1,60));
+
+cycleTypeSummary = struct();
+
+for b = 1:length(batteryNames)
+bn = batteryNames{b};
+cycles = allBatteries.(bn).cycle;
+nCharge = 0; nDischarge = 0; nImpedance = 0; nOther = 0;
+for c = 1:length(cycles)
+ctype = lower(cycles(c).type);
+switch ctype
+case 'charge'
+nCharge = nCharge + 1;
+case 'discharge'
+nDischarge = nDischarge + 1;
+case 'impedance'
+nImpedance = nImpedance + 1;
+otherwise
+nOther = nOther + 1;
+end
+end
+fprintf('%-12s | %-10d | %-10d | %-10d | %-10d\n', ...
+bn, nCharge, nDischarge, nImpedance, nOther);
+
+cycleTypeSummary.(bn).Charge = nCharge;
+cycleTypeSummary.(bn).Discharge = nDischarge;
+cycleTypeSummary.(bn).Impedance = nImpedance;
+cycleTypeSummary.(bn).Other = nOther;
+end
+
+%% 8. Save Combined Battery Struct
+save('allBatteries.mat','allBatteries','cycleTypeSummary');
+fprintf('\nAll selected batteries saved to allBatteries.mat\n');
+
+%% 9. Create Folder for Plots
+plotsDir = 'BatteryPlots';
+if ~exist(plotsDir, 'dir')
+mkdir(plotsDir);
+end
+
+%% 10. Per-Battery: Plot Cycle-Type Breakdown (Bar Chart)
+f0 = figure('Visible','off','Position',[100 100 900 400]);
+
+labels = batteryNames';
+nB = length(batteryNames);
+barData = zeros(nB,3);
+
+for b = 1:nB
+bn = batteryNames{b};
+barData(b,1) = cycleTypeSummary.(bn).Charge;
+barData(b,2) = cycleTypeSummary.(bn).Discharge;
+barData(b,3) = cycleTypeSummary.(bn).Impedance;
+end
+
+bar(categorical(labels), barData, 'grouped');
+legend({'Charge','Discharge','Impedance'},'Location','northwest');
+title('Cycle Type Distribution Per Battery');
+xlabel('Battery ID'); ylabel('Number of Cycles');
+grid on;
+
+drawnow;
+saveas(f0, fullfile(plotsDir,'cycle_type_distribution.png'));
+if isvalid(f0), close(f0); end
+
+fprintf('Saved: cycle_type_distribution.png\n');
+
+%% 11. Signal Analysis Loop (first discharge cycle)
+for b = 1:length(batteryNames)
+batchName = batteryNames{b};
+fprintf('\nProcessing Signal Analysis for %s...\n', batchName);
+cycles = allBatteries.(batchName).cycle;
+%% Find First Discharge Cycle
+targetIdx = find(strcmpi({cycles.type}, 'discharge'), 1);
+if isempty(targetIdx)
+fprintf('No discharge cycle found for %s. Skipping.\n', batchName);
+continue;
+end
+data = cycles(targetIdx).data;
+rawTime = data.Time;
+rawVoltage = data.Voltage_measured;
+rawCurrent = data.Current_measured;
+%% Plot Raw Signals
+f1 = figure('Visible','off');
+subplot(2,1,1);
+plot(rawTime, rawVoltage,'LineWidth',1.5);
+title(['Voltage vs Time - ' batchName ' (First Discharge)']);
+xlabel('Time (s)'); ylabel('Voltage (V)'); grid on;
+subplot(2,1,2);
+plot(rawTime, rawCurrent,'LineWidth',1.5);
+title(['Current vs Time - ' batchName ' (First Discharge)']);
+xlabel('Time (s)'); ylabel('Current (A)'); grid on;
+drawnow;
+saveas(f1, fullfile(plotsDir, [batchName '_raw_signals.png']));
+if isvalid(f1), close(f1); end
+%% Resample to 1 Hz
+Fs = 1;
+tUniform = (0:1:max(rawTime))';
+vUniform = interp1(rawTime, rawVoltage, tUniform, 'pchip');
+iUniform = interp1(rawTime, rawCurrent, tUniform, 'linear','extrap');
+%% Dynamic Segment Selection
+[~, pulseIdx] = max(abs(diff(iUniform)));
+startIdx = max(1, pulseIdx - 5);
+endIdx = min(pulseIdx + 500, length(tUniform));
+tSegment = tUniform(startIdx:endIdx);
+vSegment = vUniform(startIdx:endIdx);
+vDetrended = detrend(vSegment);
+%% STFT
+sigLen = length(vDetrended);
+window = 64; nfft = 128;
+if sigLen < window
+window = max(4, floor(sigLen/2)*2);
+fprintf(' Adjusting STFT window to %d for short signal.\n', window);
+end
+noverlap = floor(window/2);
+[~, F, T, P] = spectrogram(vDetrended, window, noverlap, nfft, Fs);
+%% Frequency Band Energy
+bandIdx = F >= 0.05 & F <= 0.2;
+bandEnergy = sum(P(bandIdx,:), 1);
+%% Plot Analysis
+f2 = figure('Visible','off','Position',[100 100 1000 600]);
+subplot(2,2,1);
+plot(tSegment - tSegment(1), vSegment,'LineWidth',1.5);
+title('Dynamic Segment (V)');
+xlabel('Relative Time (s)'); ylabel('Voltage (V)');
+grid on;
+subplot(2,2,2);
+imagesc(T, F, 10*log10(P + eps));
+axis xy; colorbar;
+title('STFT Spectrogram');
+xlabel('Time (s)'); ylabel('Frequency (Hz)');
+subplot(2,2,3:4);
+plot(T, bandEnergy,'LineWidth',2);
+title('Spectral Band Energy (0.05–0.2 Hz)');
+xlabel('Time (s)'); ylabel('Energy'); grid on;
+drawnow;
+saveas(f2, fullfile(plotsDir, [batchName '_analysis.png']));
+if isvalid(f2), close(f2); end
+end
+
+fprintf('\n=== Signal Analysis Complete ===\n');
+fprintf('Plots saved in: %s\n', fullfile(pwd, plotsDir));
+fprintf('\nNow run RuleBased_SOH_Screening.m for SOH classification.\n');
